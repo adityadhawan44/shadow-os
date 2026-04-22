@@ -62,10 +62,14 @@ shadow-os/
 
 ## Recommended next upgrade
 
-The current version is intentionally deployable for `₹0` as a strong product demo. The best production extension is:
+The current version is intentionally deployable for `₹0` as a strong product demo. It now includes a production-style path with:
 
-- Firebase Auth
-- Firestore sync
+- optional Firebase sign-in and Firestore sync when env keys are present
+- secure server-side AI reflections through a Vercel API route
+- graceful fallback to local-only mode when cloud services are not configured
+
+The best next extension is:
+
 - encrypted remote vault storage
 - OpenAI-powered summaries, nudges, and simulations
 

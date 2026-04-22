@@ -20,6 +20,14 @@ import {
   runFutureSimulation,
 } from "./lib/engine";
 import {
+  isFirebaseConfigured,
+  pullRemoteSnapshot,
+  pushRemoteSnapshot,
+  signInWithGoogle,
+  signOutFromFirebase,
+  subscribeToAuth,
+} from "./lib/firebase";
+import {
   clearSnapshot,
   loadSnapshot,
   normalizeSnapshot,
@@ -82,11 +90,95 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState("");
   const [isVaultVisible, setIsVaultVisible] = useState(false);
   const [feedQuery, setFeedQuery] = useState("");
+  const [authUser, setAuthUser] = useState(null);
+  const [remoteStatus, setRemoteStatus] = useState("Local-only mode");
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [aiResult, setAiResult] = useState(null);
+  const [isAiLoading, setIsAiLoading] = useState(false);
   const deferredFeedQuery = useDeferredValue(feedQuery);
+  const firebaseReady = isFirebaseConfigured();
 
   useEffect(() => {
     saveSnapshot(snapshot);
   }, [snapshot]);
+
+  useEffect(() => {
+    if (!firebaseReady) {
+      return undefined;
+    }
+
+    const unsubscribe = subscribeToAuth(async (user) => {
+      setAuthUser(user);
+
+      if (!user) {
+        setRemoteStatus("Signed out. Local mode remains active.");
+        return;
+      }
+
+      setRemoteStatus("Connected to Firebase.");
+      setIsSyncing(true);
+      try {
+        const remote = await pullRemoteSnapshot(user.uid);
+        if (remote) {
+          setSnapshot((current) => {
+            const remoteSnapshot = normalizeSnapshot(remote);
+            const localCount =
+              current.thoughts.length +
+              current.decisions.length +
+              current.mentalStates.length +
+              current.commitments.length +
+              current.vault.length;
+            const remoteCount =
+              remoteSnapshot.thoughts.length +
+              remoteSnapshot.decisions.length +
+              remoteSnapshot.mentalStates.length +
+              remoteSnapshot.commitments.length +
+              remoteSnapshot.vault.length;
+
+            return remoteCount >= localCount ? remoteSnapshot : current;
+          });
+          setStatusMessage("Remote workspace loaded.");
+        }
+      } catch {
+        setRemoteStatus("Firebase connected, but remote sync could not load.");
+      } finally {
+        setIsSyncing(false);
+      }
+    });
+
+    return unsubscribe;
+  }, [firebaseReady]);
+
+  useEffect(() => {
+    if (!firebaseReady || !authUser) {
+      return;
+    }
+
+    let cancelled = false;
+    const sync = async () => {
+      setIsSyncing(true);
+      try {
+        await pushRemoteSnapshot(authUser.uid, snapshot);
+        if (!cancelled) {
+          setRemoteStatus("Synced to Firestore.");
+        }
+      } catch {
+        if (!cancelled) {
+          setRemoteStatus("Sync failed. Local data is still safe.");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSyncing(false);
+        }
+      }
+    };
+
+    const timeout = window.setTimeout(sync, 700);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [authUser, firebaseReady, snapshot]);
 
   const scheduleToastClear = useEffectEvent(() => {
     window.clearTimeout(scheduleToastClear.timeoutId);
@@ -309,6 +401,65 @@ export default function App() {
     setStatusMessage("Workspace reset to the seeded demo state.");
   }
 
+  async function handleSignIn() {
+    try {
+      await signInWithGoogle();
+      setStatusMessage("Signed in with Google.");
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : "Sign-in could not complete.",
+      );
+    }
+  }
+
+  async function handleSignOut() {
+    try {
+      await signOutFromFirebase();
+      setStatusMessage("Signed out.");
+    } catch {
+      setStatusMessage("Sign-out could not complete.");
+    }
+  }
+
+  async function handleAiReflection() {
+    setIsAiLoading(true);
+    setAiResult(null);
+
+    try {
+      const summary = [
+        buildWeeklyNarrative(snapshot),
+        ...patterns.slice(0, 3),
+        ...nudges.slice(0, 2),
+        `Life Score: ${computeLifeScore(snapshot)}`,
+      ].join(" ");
+
+      const response = await fetch("/api/coach", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          user: snapshot.user,
+          summary,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "AI reflection failed.");
+      }
+
+      setAiResult(data.result);
+      setStatusMessage("AI reflection generated.");
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : "AI reflection failed.",
+      );
+    } finally {
+      setIsAiLoading(false);
+    }
+  }
+
   return (
     <div className={`app-shell mode-${activeMode.id}`}>
       <div className="ambient ambient-left" />
@@ -342,6 +493,36 @@ export default function App() {
               {tab.label}
             </button>
           ))}
+        </div>
+
+        <div className="hero-meta">
+          <div className="auth-card">
+            <span className="section-tag">Production mode</span>
+            <h3>Identity and sync</h3>
+            <p>
+              {firebaseReady
+                ? authUser
+                  ? `Signed in as ${authUser.displayName || authUser.email || "user"}`
+                  : "Firebase is configured. Sign in to sync your system across devices."
+                : "Firebase env keys are missing, so the app stays in reliable local mode."}
+            </p>
+            <div className="inline-fields">
+              {firebaseReady ? (
+                authUser ? (
+                  <button className="secondary" type="button" onClick={handleSignOut}>
+                    Sign out
+                  </button>
+                ) : (
+                  <button className="primary" type="button" onClick={handleSignIn}>
+                    Sign in with Google
+                  </button>
+                )
+              ) : null}
+              <span className="status-chip">
+                {isSyncing ? "Syncing..." : remoteStatus}
+              </span>
+            </div>
+          </div>
         </div>
 
         <div className="hero-grid">
@@ -434,6 +615,56 @@ export default function App() {
                     </div>
                   ))}
                 </div>
+              </article>
+            </section>
+
+            <section className="panel two-column">
+              <article className="panel-card">
+                <span className="section-tag">AI reflection</span>
+                <h2>Secure server-side coaching</h2>
+                <p>
+                  This uses the Vercel `/api/coach` endpoint so your API key stays on the
+                  server, not in the browser.
+                </p>
+                <div className="action-column">
+                  <button
+                    className="primary"
+                    type="button"
+                    onClick={handleAiReflection}
+                    disabled={isAiLoading}
+                  >
+                    {isAiLoading ? "Generating..." : "Generate AI Reflection"}
+                  </button>
+                </div>
+              </article>
+
+              <article className="panel-card">
+                <span className="section-tag">Coach output</span>
+                <h2>Adaptive response</h2>
+                {aiResult ? (
+                  <div className="stack-list">
+                    <div className="feed-item">
+                      <span className="micro-label">Reflection</span>
+                      <div>{aiResult.reflection}</div>
+                    </div>
+                    <div className="feed-item">
+                      <span className="micro-label">Nudge</span>
+                      <div>{aiResult.nudge}</div>
+                    </div>
+                    <div className="feed-item">
+                      <span className="micro-label">Risk</span>
+                      <div>{aiResult.risk}</div>
+                    </div>
+                    <div className="feed-item">
+                      <span className="micro-label">Next step</span>
+                      <div>{aiResult.next_step}</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="feed-item">
+                    Generate a reflection after deployment with `OPENAI_API_KEY` configured.
+                  </div>
+                )}
               </article>
             </section>
           </>
@@ -855,6 +1086,22 @@ export default function App() {
                 <button className="secondary" type="button" onClick={handleReset}>
                   Reset to Demo Data
                 </button>
+              </div>
+            </article>
+
+            <article className="panel-card">
+              <span className="section-tag">Deployment readiness</span>
+              <h2>Production checklist</h2>
+              <div className="stack-list">
+                <div className="feed-item">
+                  Vercel API route added for secure OpenAI requests.
+                </div>
+                <div className="feed-item">
+                  Firebase auth and Firestore sync activate automatically when env keys exist.
+                </div>
+                <div className="feed-item">
+                  Offline mode remains available if cloud services are not configured yet.
+                </div>
               </div>
             </article>
 

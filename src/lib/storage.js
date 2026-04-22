@@ -71,6 +71,11 @@ function normalizeVaultEntry(entry, index) {
     createdAt: stringOrFallback(entry?.createdAt, new Date().toISOString()),
     title: stringOrFallback(entry?.title),
     content: stringOrFallback(entry?.content),
+    encryptedContent:
+      typeof entry?.encryptedContent === "object" && entry?.encryptedContent
+        ? entry.encryptedContent
+        : null,
+    isEncrypted: Boolean(entry?.isEncrypted),
   };
 }
 

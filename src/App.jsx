@@ -33,14 +33,13 @@ import {
   normalizeSnapshot,
   saveSnapshot,
 } from "./lib/storage";
+import {
+  decryptVaultText,
+  encryptVaultText,
+  isCryptoAvailable,
+} from "./lib/vaultCrypto";
 
-const defaultThoughtForm = {
-  text: "",
-  intent: "",
-  tags: "",
-  intensity: 6,
-};
-
+const defaultThoughtForm = { text: "", intent: "", tags: "", intensity: 6 };
 const defaultDecisionForm = {
   title: "",
   category: "",
@@ -50,7 +49,6 @@ const defaultDecisionForm = {
   confidence: 6,
   outcomeScore: 70,
 };
-
 const defaultStateForm = {
   mood: 6,
   energy: 6,
@@ -59,17 +57,8 @@ const defaultStateForm = {
   socialMediaMinutes: 20,
   note: "",
 };
-
-const defaultCommitmentForm = {
-  title: "",
-  dueDate: "",
-  status: "planned",
-};
-
-const defaultVaultForm = {
-  title: "",
-  content: "",
-};
+const defaultCommitmentForm = { title: "", dueDate: "", status: "planned" };
+const defaultVaultForm = { title: "", content: "" };
 
 const tabs = [
   { id: "dashboard", label: "Dashboard" },
@@ -95,8 +84,14 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [aiResult, setAiResult] = useState(null);
   const [isAiLoading, setIsAiLoading] = useState(false);
+  const [vaultPassphrase, setVaultPassphrase] = useState("");
+  const [unlockedVault, setUnlockedVault] = useState({});
+  const [notificationPermission, setNotificationPermission] = useState(() =>
+    typeof Notification === "undefined" ? "unsupported" : Notification.permission,
+  );
   const deferredFeedQuery = useDeferredValue(feedQuery);
   const firebaseReady = isFirebaseConfigured();
+  const cryptoReady = isCryptoAvailable();
 
   useEffect(() => {
     saveSnapshot(snapshot);
@@ -109,7 +104,6 @@ export default function App() {
 
     const unsubscribe = subscribeToAuth(async (user) => {
       setAuthUser(user);
-
       if (!user) {
         setRemoteStatus("Signed out. Local mode remains active.");
         return;
@@ -134,7 +128,6 @@ export default function App() {
               remoteSnapshot.mentalStates.length +
               remoteSnapshot.commitments.length +
               remoteSnapshot.vault.length;
-
             return remoteCount >= localCount ? remoteSnapshot : current;
           });
           setStatusMessage("Remote workspace loaded.");
@@ -218,10 +211,7 @@ export default function App() {
     updateSnapshot(
       (current) => ({
         ...current,
-        user: {
-          ...current.user,
-          [field]: value,
-        },
+        user: { ...current.user, [field]: value },
       }),
       null,
     );
@@ -337,29 +327,47 @@ export default function App() {
     setCommitmentForm(defaultCommitmentForm);
   }
 
-  function handleVaultSubmit(event) {
+  async function handleVaultSubmit(event) {
     event.preventDefault();
     if (!vaultForm.title.trim() || !vaultForm.content.trim()) {
       setStatusMessage("Vault title and content are required.");
       return;
     }
+    if (!vaultPassphrase.trim()) {
+      setStatusMessage("Set a vault passphrase before storing encrypted entries.");
+      return;
+    }
+    if (!cryptoReady) {
+      setStatusMessage("Browser crypto is unavailable, so vault encryption cannot run.");
+      return;
+    }
 
-    updateSnapshot(
-      (current) => ({
-        ...current,
-        vault: [
-          {
-            id: createId("vault"),
-            createdAt: new Date().toISOString(),
-            title: vaultForm.title.trim(),
-            content: vaultForm.content.trim(),
-          },
-          ...current.vault,
-        ],
-      }),
-      "Vault entry stored.",
-    );
-    setVaultForm(defaultVaultForm);
+    try {
+      const encryptedContent = await encryptVaultText(
+        vaultForm.content.trim(),
+        vaultPassphrase.trim(),
+      );
+      updateSnapshot(
+        (current) => ({
+          ...current,
+          vault: [
+            {
+              id: createId("vault"),
+              createdAt: new Date().toISOString(),
+              title: vaultForm.title.trim(),
+              content: "",
+              encryptedContent,
+              isEncrypted: true,
+            },
+            ...current.vault,
+          ],
+        }),
+        "Vault entry encrypted and stored.",
+      );
+      setVaultForm(defaultVaultForm);
+    } catch {
+      setStatusMessage("Vault encryption failed. Try again.");
+    }
   }
 
   function handleExport() {
@@ -424,7 +432,6 @@ export default function App() {
   async function handleAiReflection() {
     setIsAiLoading(true);
     setAiResult(null);
-
     try {
       const summary = [
         buildWeeklyNarrative(snapshot),
@@ -435,13 +442,8 @@ export default function App() {
 
       const response = await fetch("/api/coach", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          user: snapshot.user,
-          summary,
-        }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user: snapshot.user, summary }),
       });
 
       const data = await response.json();
@@ -458,6 +460,105 @@ export default function App() {
     } finally {
       setIsAiLoading(false);
     }
+  }
+
+  async function handleUnlockVault() {
+    if (!vaultPassphrase.trim()) {
+      setStatusMessage("Enter your vault passphrase first.");
+      return;
+    }
+    try {
+      const decryptedEntries = await Promise.all(
+        snapshot.vault.map(async (entry) => {
+          if (!entry.isEncrypted || !entry.encryptedContent) {
+            return [entry.id, entry.content];
+          }
+          const plainText = await decryptVaultText(
+            entry.encryptedContent,
+            vaultPassphrase.trim(),
+          );
+          return [entry.id, plainText];
+        }),
+      );
+      setUnlockedVault(Object.fromEntries(decryptedEntries));
+      setIsVaultVisible(true);
+      setStatusMessage("Vault unlocked for this session.");
+    } catch {
+      setStatusMessage("Vault unlock failed. Check the passphrase.");
+    }
+  }
+
+  async function handleEncryptLegacyVault() {
+    if (!vaultPassphrase.trim()) {
+      setStatusMessage("Enter a vault passphrase before migrating old entries.");
+      return;
+    }
+
+    const legacyEntries = snapshot.vault.filter(
+      (entry) => !entry.isEncrypted && entry.content.trim(),
+    );
+    if (!legacyEntries.length) {
+      setStatusMessage("All vault entries are already encrypted.");
+      return;
+    }
+
+    try {
+      const encryptedLegacy = await Promise.all(
+        legacyEntries.map(async (entry) => ({
+          id: entry.id,
+          encryptedContent: await encryptVaultText(entry.content, vaultPassphrase.trim()),
+        })),
+      );
+      updateSnapshot(
+        (current) => ({
+          ...current,
+          vault: current.vault.map((entry) => {
+            const migrated = encryptedLegacy.find((item) => item.id === entry.id);
+            if (!migrated) {
+              return entry;
+            }
+            return {
+              ...entry,
+              content: "",
+              encryptedContent: migrated.encryptedContent,
+              isEncrypted: true,
+            };
+          }),
+        }),
+        "Legacy vault entries encrypted.",
+      );
+    } catch {
+      setStatusMessage("Legacy vault migration failed.");
+    }
+  }
+
+  async function handleNotificationPermission() {
+    if (typeof Notification === "undefined") {
+      setStatusMessage("Browser notifications are not supported here.");
+      return;
+    }
+    const result = await Notification.requestPermission();
+    setNotificationPermission(result);
+    setStatusMessage(
+      result === "granted"
+        ? "Notification nudges enabled."
+        : "Notification permission was not granted.",
+    );
+  }
+
+  function handleSendNudge() {
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") {
+      setStatusMessage("Enable notification permission first.");
+      return;
+    }
+    const topNudge =
+      nudges[0] || "Your pattern window is open. Choose the harder right thing now.";
+    const notification = new Notification("Shadow OS Nudge", {
+      body: topNudge,
+      tag: "shadow-os-nudge",
+    });
+    window.setTimeout(() => notification.close(), 8000);
+    setStatusMessage("Behavioral nudge sent to your browser.");
   }
 
   return (
@@ -478,8 +579,8 @@ export default function App() {
         </div>
 
         <p className="hero-copy">
-          A self-evolving system that learns your behavior, predicts outcomes,
-          exposes your intent-action gap, and nudges you before the pattern wins.
+          The behavioral operating system that learns your patterns, predicts your
+          direction, protects your private truth, and nudges you before the pattern wins.
         </p>
 
         <div className="hero-actions">
@@ -609,7 +710,7 @@ export default function App() {
                   {feed.map((item) => (
                     <div key={item.id} className="feed-item">
                       <span className="micro-label">
-                        {item.type} · {item.createdLabel}
+                        {item.type} | {item.createdLabel}
                       </span>
                       <div>{item.text}</div>
                     </div>
@@ -662,7 +763,8 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="feed-item">
-                    Generate a reflection after deployment with `OPENAI_API_KEY` configured.
+                    Generate a reflection after deployment with `OPENAI_API_KEY`
+                    configured.
                   </div>
                 )}
               </article>
@@ -679,10 +781,7 @@ export default function App() {
                 <textarea
                   value={thoughtForm.text}
                   onChange={(event) =>
-                    setThoughtForm((current) => ({
-                      ...current,
-                      text: event.target.value,
-                    }))
+                    setThoughtForm((current) => ({ ...current, text: event.target.value }))
                   }
                   placeholder="What are you thinking right now?"
                 />
@@ -699,10 +798,7 @@ export default function App() {
                 <input
                   value={thoughtForm.tags}
                   onChange={(event) =>
-                    setThoughtForm((current) => ({
-                      ...current,
-                      tags: event.target.value,
-                    }))
+                    setThoughtForm((current) => ({ ...current, tags: event.target.value }))
                   }
                   placeholder="Tags, comma separated"
                 />
@@ -854,10 +950,7 @@ export default function App() {
                 <textarea
                   value={stateForm.note}
                   onChange={(event) =>
-                    setStateForm((current) => ({
-                      ...current,
-                      note: event.target.value,
-                    }))
+                    setStateForm((current) => ({ ...current, note: event.target.value }))
                   }
                   placeholder="What influenced your state?"
                 />
@@ -937,7 +1030,7 @@ export default function App() {
                 {snapshot.decisions.slice(0, 5).map((decision) => (
                   <div key={decision.id} className="feed-item">
                     <span className="micro-label">
-                      {decision.category || "General"} · {decision.outcomeScore}/100
+                      {decision.category || "General"} | {decision.outcomeScore}/100
                     </span>
                     <strong>{decision.title}</strong>
                     <p>{decision.actualOutcome || decision.choice}</p>
@@ -951,10 +1044,12 @@ export default function App() {
               <h2>Reliability layer</h2>
               <div className="stack-list">
                 <div className="feed-item">
-                  Offline-first local persistence keeps the app usable without backend setup.
+                  Offline-first local persistence keeps the app usable without backend
+                  setup.
                 </div>
                 <div className="feed-item">
-                  Schema normalization guards imported and stored data from breaking the UI.
+                  Schema normalization guards imported and stored data from breaking the
+                  UI.
                 </div>
                 <div className="feed-item">
                   Manual backup export and import keep user history portable.
@@ -969,7 +1064,17 @@ export default function App() {
             <article className="panel-card">
               <span className="section-tag">Private vault</span>
               <h2>Store the truth you do not show elsewhere</h2>
+              <p>
+                Entries are encrypted in the browser with your passphrase before they are
+                stored.
+              </p>
               <form className="form-grid" onSubmit={handleVaultSubmit}>
+                <input
+                  type="password"
+                  value={vaultPassphrase}
+                  onChange={(event) => setVaultPassphrase(event.target.value)}
+                  placeholder="Vault passphrase"
+                />
                 <input
                   value={vaultForm.title}
                   onChange={(event) =>
@@ -991,7 +1096,7 @@ export default function App() {
                   placeholder="Write the unfiltered version"
                 />
                 <button className="primary" type="submit">
-                  Lock Entry
+                  Encrypt And Lock Entry
                 </button>
               </form>
             </article>
@@ -1002,19 +1107,39 @@ export default function App() {
                   <span className="section-tag">Vault memory</span>
                   <h2>Protected notes</h2>
                 </div>
+                <button className="secondary" type="button" onClick={handleUnlockVault}>
+                  {isVaultVisible ? "Unlocked" : "Unlock Vault"}
+                </button>
+              </div>
+              <div className="inline-fields">
                 <button
                   className="secondary"
                   type="button"
-                  onClick={() => setIsVaultVisible((current) => !current)}
+                  onClick={() => {
+                    setIsVaultVisible(false);
+                    setUnlockedVault({});
+                    setStatusMessage("Vault hidden.");
+                  }}
                 >
-                  {isVaultVisible ? "Hide" : "Reveal"}
+                  Hide Vault
+                </button>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={handleEncryptLegacyVault}
+                >
+                  Encrypt Old Entries
                 </button>
               </div>
               <div className="stack-list">
                 {snapshot.vault.map((entry) => (
                   <div key={entry.id} className="feed-item">
                     <span className="micro-label">{entry.title}</span>
-                    <div>{isVaultVisible ? entry.content : "Hidden for privacy."}</div>
+                    <div>
+                      {isVaultVisible
+                        ? unlockedVault[entry.id] || "Encrypted entry locked."
+                        : "Hidden for privacy."}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1097,10 +1222,35 @@ export default function App() {
                   Vercel API route added for secure OpenAI requests.
                 </div>
                 <div className="feed-item">
-                  Firebase auth and Firestore sync activate automatically when env keys exist.
+                  Firebase auth and Firestore sync activate automatically when env keys
+                  exist.
                 </div>
                 <div className="feed-item">
                   Offline mode remains available if cloud services are not configured yet.
+                </div>
+              </div>
+            </article>
+
+            <article className="panel-card">
+              <span className="section-tag">Notification nudges</span>
+              <h2>Browser reminders</h2>
+              <div className="stack-list">
+                <div className="feed-item">Status: {notificationPermission}</div>
+                <div className="inline-fields">
+                  <button
+                    className="primary"
+                    type="button"
+                    onClick={handleNotificationPermission}
+                  >
+                    Enable Notifications
+                  </button>
+                  <button className="secondary" type="button" onClick={handleSendNudge}>
+                    Test Nudge
+                  </button>
+                </div>
+                <div className="feed-item">
+                  This is the zero-backend version of nudges. Push or email delivery can
+                  be layered on later with service credentials.
                 </div>
               </div>
             </article>

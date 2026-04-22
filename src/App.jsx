@@ -20,6 +20,7 @@ import {
   runFutureSimulation,
 } from "./lib/engine";
 import {
+  getMissingFirebaseKeys,
   isFirebaseConfigured,
   pullRemoteSnapshot,
   pushRemoteSnapshot,
@@ -38,6 +39,22 @@ import {
   encryptVaultText,
   isCryptoAvailable,
 } from "./lib/vaultCrypto";
+
+function buildClientCoachFallback(snapshot, patterns, nudges, simulation) {
+  return {
+    reflection: `${snapshot.user.coachVoice} sees a stable local pattern set. ${patterns[0] || "More logs will sharpen this."}`,
+    nudge:
+      nudges[0] ||
+      "Protect the next 20 minutes from distraction and convert intention into one visible action.",
+    risk:
+      simulation.direction === "fragile"
+        ? "If the current pattern repeats, self-trust erodes faster than motivation can repair it."
+        : "Momentum is improving, but drift can return if you stop logging and acting consciously.",
+    next_step:
+      "Use the log center right after this reflection and capture one decision you are about to make.",
+    source: "local-fallback",
+  };
+}
 
 const defaultThoughtForm = { text: "", intent: "", tags: "", intensity: 6 };
 const defaultDecisionForm = {
@@ -92,6 +109,7 @@ export default function App() {
   const deferredFeedQuery = useDeferredValue(feedQuery);
   const firebaseReady = isFirebaseConfigured();
   const cryptoReady = isCryptoAvailable();
+  const missingFirebaseKeys = getMissingFirebaseKeys();
 
   useEffect(() => {
     saveSnapshot(snapshot);
@@ -105,7 +123,7 @@ export default function App() {
     const unsubscribe = subscribeToAuth(async (user) => {
       setAuthUser(user);
       if (!user) {
-        setRemoteStatus("Signed out. Local mode remains active.");
+        setRemoteStatus("Cloud sync is available when you sign in. Local mode remains active.");
         return;
       }
 
@@ -447,16 +465,19 @@ export default function App() {
       });
 
       const data = await response.json();
-      if (!response.ok) {
+      if (!response.ok || !data?.result) {
         throw new Error(data.error || "AI reflection failed.");
       }
 
       setAiResult(data.result);
-      setStatusMessage("AI reflection generated.");
-    } catch (error) {
       setStatusMessage(
-        error instanceof Error ? error.message : "AI reflection failed.",
+        data.result.source === "local-fallback"
+          ? "Local AI-style reflection generated."
+          : "AI reflection generated.",
       );
+    } catch (error) {
+      setAiResult(buildClientCoachFallback(snapshot, patterns, nudges, simulation));
+      setStatusMessage("Local reflection fallback generated.");
     } finally {
       setIsAiLoading(false);
     }
@@ -605,7 +626,7 @@ export default function App() {
                 ? authUser
                   ? `Signed in as ${authUser.displayName || authUser.email || "user"}`
                   : "Firebase is configured. Sign in to sync your system across devices."
-                : "Firebase env keys are missing, so the app stays in reliable local mode."}
+                : "Private local mode is active. The app is fully usable on this device without cloud sync."}
             </p>
             <div className="inline-fields">
               {firebaseReady ? (
@@ -623,6 +644,13 @@ export default function App() {
                 {isSyncing ? "Syncing..." : remoteStatus}
               </span>
             </div>
+            {!firebaseReady ? (
+              <div className="stack-list">
+                <div className="feed-item">
+                  Missing optional cloud keys: {missingFirebaseKeys.join(", ")}
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
 
@@ -760,11 +788,19 @@ export default function App() {
                       <span className="micro-label">Next step</span>
                       <div>{aiResult.next_step}</div>
                     </div>
+                    <div className="feed-item">
+                      <span className="micro-label">Mode</span>
+                      <div>
+                        {aiResult.source === "local-fallback"
+                          ? "Local coaching fallback"
+                          : "OpenAI server response"}
+                      </div>
+                    </div>
                   </div>
                 ) : (
                   <div className="feed-item">
-                    Generate a reflection after deployment with `OPENAI_API_KEY`
-                    configured.
+                    Generate a reflection now. If `OPENAI_API_KEY` is absent, Shadow OS
+                    will use a built-in local coaching fallback.
                   </div>
                 )}
               </article>

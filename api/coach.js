@@ -1,15 +1,20 @@
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+function buildLocalCoachFallback(user, summary) {
+  const mission = user?.mission || "build a steadier operating rhythm";
+  const reflection = `Local Shadow OS readout: your recent logs suggest recurring patterns that are shaping identity more than intention. The system is still useful without cloud AI because the behavioral signals are already visible.`;
+  const nudge = `Choose one concrete move that supports your mission to ${mission}, then do it before opening another distracting tab or app.`;
+  const risk = summary.toLowerCase().includes("miss")
+    ? "Repeated missed commitments can turn temporary inconsistency into self-image."
+    : "When friction stays vague, reactive behavior usually takes control again.";
+  const next_step =
+    "Log one new thought or decision today and use that as the trigger for a clean next action.";
 
-function json(status, body) {
   return {
-    statusCode: status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "POST,OPTIONS",
-    },
-    body: JSON.stringify(body),
+    reflection,
+    nudge,
+    risk,
+    next_step,
+    source: "local-fallback",
   };
 }
 
@@ -22,16 +27,16 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed." });
   }
 
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({
-      error: "OPENAI_API_KEY is missing. Add it in your deployment environment.",
-    });
-  }
-
   try {
     const { user, summary } = req.body ?? {};
     if (!summary) {
       return res.status(400).json({ error: "Summary payload is required." });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(200).json({
+        result: buildLocalCoachFallback(user, summary),
+      });
     }
 
     const prompt = [
@@ -84,8 +89,10 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ result: JSON.parse(content) });
   } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : "Unexpected server error.",
+    const { user, summary } = req.body ?? {};
+    return res.status(200).json({
+      result: buildLocalCoachFallback(user, summary || ""),
+      warning: error instanceof Error ? error.message : "Unexpected server fallback.",
     });
   }
 }
